@@ -1,6 +1,6 @@
 // Browser-only: ffmpeg.wasm runs inside its own Web Worker (managed by @ffmpeg/ffmpeg).
 export type Orientation = "vertical" | "horizontal";
-export type Quality = "hd" | "4k";
+export type Quality = "4k" | "1080" | "720";
 export type Fit = "crop" | "canvas";
 export type Part = { name: string; blob: Blob; url: string; size: number };
 export type Settings = { orientation: Orientation; quality: Quality; fit: Fit };
@@ -9,23 +9,39 @@ const CDNS = [
   "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm",
   "https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm",
 ];
+const CACHE = "ffmpeg-core-0.12.10";
 export const SEG = 90; // WhatsApp Status supports up to 1:30 per post
 let ffmpegPromise: Promise<any> | null = null;
 let current: any = null;
 let cancelled = false;
+
+export const PRESETS: Record<Quality, {
+  label: string; v: [number, number]; level: string; b: string; max: string; buf: string;
+}> = {
+  "4k": { label: "4K WhatsApp friendly", v: [2160, 3840], level: "5.1", b: "8000k", max: "10000k", buf: "20000k" },
+  "1080": { label: "1080p WhatsApp friendly", v: [1080, 1920], level: "4.2", b: "2500k", max: "3000k", buf: "6000k" },
+  "720": { label: "720p WhatsApp friendly", v: [720, 1280], level: "4.0", b: "1500k", max: "2000k", buf: "4000k" },
+};
 
 export function isSupported() {
   return typeof window !== "undefined" && typeof WebAssembly === "object" && typeof Worker !== "undefined";
 }
 
 export function dims(s: Settings): [number, number] {
-  const big = s.quality === "4k";
-  if (s.orientation === "vertical") return big ? [2160, 3840] : [1080, 1920];
-  return big ? [3840, 2160] : [1280, 720];
+  const [a, b] = PRESETS[s.quality].v;
+  return s.orientation === "vertical" ? [a, b] : [b, a];
 }
 
-// Download a file with byte progress, return a blob URL.
-async function fetchWithProgress(url: string, type: string, onBytes: (n: number) => void) {
+// Download once, keep in the browser's Cache Storage so later visits start instantly.
+async function cachedBlobURL(url: string, type: string, onBytes: (n: number) => void) {
+  let cache: Cache | null = null;
+  try { cache = await caches.open(CACHE); } catch { /* cache unavailable */ }
+  const hit = await cache?.match(url);
+  if (hit) {
+    const blob = await hit.blob();
+    onBytes(blob.size);
+    return URL.createObjectURL(new Blob([blob], { type }));
+  }
   const res = await fetch(url);
   if (!res.ok || !res.body) throw new Error(`Download failed ${res.status}`);
   const reader = res.body.getReader();
@@ -36,54 +52,74 @@ async function fetchWithProgress(url: string, type: string, onBytes: (n: number)
     chunks.push(value);
     onBytes(value.length);
   }
-  return URL.createObjectURL(new Blob(chunks as BlobPart[], { type }));
+  const blob = new Blob(chunks as BlobPart[], { type });
+  try { await cache?.put(url, new Response(blob, { headers: { "Content-Type": type } })); } catch { /* quota */ }
+  return URL.createObjectURL(blob);
 }
 
-async function getFFmpeg(onLoad: (mb: number) => void) {
+type LoadListener = (mb: number) => void;
+const listeners = new Set<LoadListener>();
+let engineReady = false;
+export const isEngineReady = () => engineReady;
+
+function getFFmpeg(onLoad?: LoadListener) {
+  if (onLoad) listeners.add(onLoad);
   if (!ffmpegPromise) {
+    engineReady = false;
     ffmpegPromise = (async () => {
       const { FFmpeg } = await import("@ffmpeg/ffmpeg");
       let lastErr: unknown;
       for (const base of CDNS) {
         try {
           let total = 0;
-          const tick = (n: number) => { total += n; onLoad(total / 1048576); };
-          const coreURL = await fetchWithProgress(`${base}/ffmpeg-core.js`, "text/javascript", tick);
-          const wasmURL = await fetchWithProgress(`${base}/ffmpeg-core.wasm`, "application/wasm", tick);
+          const tick = (n: number) => { total += n; listeners.forEach((l) => l(total / 1048576)); };
+          const coreURL = await cachedBlobURL(`${base}/ffmpeg-core.js`, "text/javascript", tick);
+          const wasmURL = await cachedBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm", tick);
           const ff = new FFmpeg();
           await ff.load({ coreURL, wasmURL });
+          engineReady = true;
           return ff;
         } catch (e) { lastErr = e; }
       }
       throw lastErr;
     })().catch((e) => { ffmpegPromise = null; throw e; });
   }
-  return ffmpegPromise;
+  const p = ffmpegPromise;
+  p.finally(() => onLoad && listeners.delete(onLoad)).catch(() => {});
+  return p;
 }
 
-/** Stop the running conversion immediately. */
+/** Start loading the engine in the background as soon as the page opens. */
+export function preloadEngine(onLoad?: LoadListener) {
+  return getFFmpeg(onLoad).then(() => true);
+}
+
+/** Stop the running conversion immediately, then warm up a fresh engine. */
 export function cancelConversion() {
   cancelled = true;
   if (current) {
     try { current.terminate(); } catch { /* already gone */ }
   }
   current = null;
-  ffmpegPromise = null; // engine must be reloaded after terminate
+  ffmpegPromise = null;
+  engineReady = false;
+  getFFmpeg().catch(() => {}); // reloads from cache — ready again in seconds
 }
 
 export function buildArgs(s: Settings, start: number, len: number, out: string) {
   const [w, h] = dims(s);
+  const p = PRESETS[s.quality];
   const sharpen = "unsharp=5:5:0.8:3:3:0.4";
+  const bw = Math.round(w / 8) * 2, bh = Math.round(h / 8) * 2;
   const vf = s.fit === "canvas"
-    ? `split[a][b];[a]scale=${w / 4}:${h / 4}:force_original_aspect_ratio=increase,crop=${w / 4}:${h / 4},boxblur=10:2,scale=${w}:${h}[bg];[b]scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,${sharpen},setsar=1`
+    ? `split[a][b];[a]scale=${bw}:${bh}:force_original_aspect_ratio=increase,crop=${bw}:${bh},boxblur=10:2,scale=${w}:${h}[bg];[b]scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos,scale=trunc(iw/2)*2:trunc(ih/2)*2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,${sharpen},setsar=1`
     : `scale=${w}:${h}:force_original_aspect_ratio=increase:flags=lanczos,crop=${w}:${h},${sharpen},setsar=1`;
-  const is4k = s.quality === "4k";
   return [
     "-ss", String(start), "-t", String(len), "-i", "input",
     "-vf", vf,
-    "-c:v", "libx264", "-profile:v", "high", "-level:v", is4k ? "5.1" : "4.2",
+    "-c:v", "libx264", "-profile:v", "high", "-level:v", p.level,
     "-crf", "28", "-preset", "slow",
-    "-b:v", is4k ? "8000k" : "2500k", "-maxrate", is4k ? "10000k" : "3000k", "-bufsize", is4k ? "20000k" : "6000k",
+    "-b:v", p.b, "-maxrate", p.max, "-bufsize", p.buf,
     "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
     "-r", "30", "-fps_mode", "cfr", "-movflags", "+faststart", out,
   ];
@@ -96,8 +132,8 @@ export async function convert(
   onProgress: (p: number, stage: string) => void,
 ): Promise<Part[]> {
   cancelled = false;
-  onProgress(0, "Downloading converter engine (one time, ~31MB)…");
-  const ff = await getFFmpeg((mb) => onProgress(0, `Downloading converter engine… ${mb.toFixed(1)} / ~31MB`));
+  if (!engineReady) onProgress(0, "Getting converter engine ready…");
+  const ff = await getFFmpeg((mb) => onProgress(0, `Getting converter engine ready… ${mb.toFixed(1)} / ~31MB`));
   current = ff;
   if (cancelled) throw new Error("cancelled");
   onProgress(0, "Reading your video…");
@@ -115,7 +151,7 @@ export async function convert(
     const logHandler = ({ message }: { message: string }) => {
       const m = /time=(\d+):(\d+):(\d+\.?\d*)/.exec(message);
       if (!m) return;
-      const t = +m[1] * 3600 + +m[2] * 60 + +m[3];
+      const t = Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0);
       const p = Math.min(1, Math.max(0, t / len));
       onProgress(((i + p) / count) * 100, stage);
     };
