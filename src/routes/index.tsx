@@ -5,7 +5,7 @@ import {
   X, Play, History, Trash2, Crop, Frame,
 } from "lucide-react";
 import {
-  cancelConversion, convert, dims, fmtBytes, fmtTime, isSupported, shareToWhatsApp, SEG,
+  cancelConversion, convert, preloadEngine, PRESETS, dims, fmtBytes, fmtTime, isSupported, shareToWhatsApp, SEG,
   type Fit, type Orientation, type Part, type Quality,
 } from "@/lib/converter";
 import { addHistory, clearHistory, deleteHistory, listHistory, type HistoryItem } from "@/lib/history";
@@ -57,7 +57,7 @@ function Toggle<T extends string>({ value, onChange, options, disabled }: {
 function Index() {
   const [supported, setSupported] = useState(true);
   const [orientation, setOrientation] = useState<Orientation>("vertical");
-  const [quality, setQuality] = useState<Quality>("hd");
+  const [quality, setQuality] = useState<Quality>("1080");
   const [fit, setFit] = useState<Fit>("crop");
   const [auto, setAuto] = useState(true);
   const [info, setInfo] = useState<Info | null>(null);
@@ -68,6 +68,8 @@ function Index() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [drag, setDrag] = useState(false);
+  const [engine, setEngine] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [engineMb, setEngineMb] = useState(0);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const runId = useRef(0);
@@ -79,6 +81,10 @@ function Index() {
     setSupported(isSupported());
     try { setAuto(localStorage.getItem("autoConvert") !== "off"); } catch { /* ignore */ }
     listHistory().then(setHistory).catch(() => {});
+    if (isSupported()) {
+      setEngine("loading");
+      preloadEngine((mb) => setEngineMb(mb)).then(() => setEngine("ready")).catch(() => setEngine("error"));
+    }
   }, []);
 
   function toggleAuto() {
@@ -180,10 +186,16 @@ function Index() {
               { v: "canvas", label: "Canvas (blur bars)", icon: <Frame className="h-4 w-4" /> },
             ]} />
             <Toggle value={quality} onChange={setQuality} disabled={busy} options={[
-              { v: "hd", label: "HD 1080p" },
-              { v: "4k", label: "True 4K" },
+              { v: "4k", label: "4K WhatsApp friendly" },
+              { v: "1080", label: "1080p WhatsApp friendly" },
+              { v: "720", label: "720p WhatsApp friendly" },
             ]} />
           </div>
+          <p className={`rounded-full border px-3 py-1 text-xs ${engine === "ready" ? "border-whatsapp/50 text-whatsapp" : engine === "error" ? "border-destructive/50 text-destructive" : "border-border text-muted-foreground"}`}>
+            {engine === "ready" ? "● Converter engine ready — drop a video to start instantly"
+              : engine === "error" ? "Engine couldn't load — check your internet, it will retry when you convert"
+              : `Preparing converter engine… ${engineMb.toFixed(1)} / ~31MB (one time only)`}
+          </p>
           <label className="flex cursor-pointer items-center gap-3 text-sm">
             <button role="switch" aria-checked={auto} aria-label="Auto convert" onClick={toggleAuto}
               className={`relative h-6 w-11 rounded-full transition ${auto ? "bg-primary" : "bg-muted"}`}>
@@ -193,7 +205,7 @@ function Index() {
           </label>
           {quality === "4k" && (
             <p className="max-w-lg text-center text-xs text-muted-foreground">
-              True 4K = {ow}×{oh}. It takes about 4× longer and needs a strong phone/PC. WhatsApp Status itself plays at up to 1080p, so HD is usually the sharpest result there.
+              4K = {ow}×{oh} file (works with Fill or Canvas). Takes about 4× longer and needs a strong phone/PC. Note: WhatsApp itself decides the final Status quality — it shows Status at up to about 1080p, so a 4K file looks extra sharp but WhatsApp won't play it as 4K.
             </p>
           )}
         </div>
@@ -263,14 +275,14 @@ function Index() {
             <h2 className="font-display text-xl font-bold">Before vs After</h2>
             <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
               <div className="rounded-xl bg-muted p-4"><p className="text-muted-foreground">Original</p><p className="mt-1 text-lg font-semibold">{fmtBytes(info.file.size)}</p><p>{info.w ? `${info.w}×${info.h}` : "—"}</p></div>
-              <div className="rounded-xl bg-primary/15 p-4"><p className="text-primary">{quality === "4k" ? "4K Status" : "HD Status"}</p><p className="mt-1 text-lg font-semibold">{fmtBytes(totalOut)}</p><p>{ow}×{oh} · 30fps</p></div>
+              <div className="rounded-xl bg-primary/15 p-4"><p className="text-primary">{PRESETS[quality].label}</p><p className="mt-1 text-lg font-semibold">{fmtBytes(totalOut)}</p><p>{ow}×{oh} · 30fps</p></div>
             </div>
             <div className="mt-5 space-y-3">
               {parts.map((p, i) => (
                 <div key={p.name} className="flex flex-col gap-2 rounded-xl border border-border p-3 sm:flex-row sm:items-center">
                   <span className="flex-1 truncate text-sm font-medium">{p.name}</span>
                   <a href={p.url} download={p.name} className="inline-flex items-center justify-center gap-2 rounded-full bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground">
-                    <Download className="h-4 w-4" /> Download Part {i + 1} ({fmtBytes(p.size)} - {quality === "4k" ? "4K" : "HD"})
+                    <Download className="h-4 w-4" /> Download Part {i + 1} ({fmtBytes(p.size)} - {quality === "4k" ? "4K" : quality === "1080" ? "HD" : "720p"})
                   </a>
                   <button onClick={() => shareToWhatsApp(p).catch(() => {})} className="inline-flex items-center justify-center gap-2 rounded-full bg-whatsapp px-4 py-2 text-sm font-semibold text-whatsapp-foreground">
                     <Share2 className="h-4 w-4" /> Share to WhatsApp
@@ -279,7 +291,7 @@ function Index() {
               ))}
             </div>
             <p className="mt-4 rounded-xl bg-muted p-3 text-sm">
-              {parts.length > 1 ? "Post Part 1, then Part 2 on WhatsApp Status - WhatsApp will NOT compress again." : "Post it on WhatsApp Status - WhatsApp will NOT compress again."}
+              {parts.length > 1 ? "Post Part 1, then Part 2 on WhatsApp Status — already in WhatsApp's preferred format, so it compresses them as little as possible." : "Post it on WhatsApp Status — already in WhatsApp's preferred format, so it compresses it as little as possible."}
               {" "}On phones, "Share to WhatsApp" opens the share sheet — pick WhatsApp → My Status.
             </p>
           </section>
@@ -289,9 +301,9 @@ function Index() {
           {[
             ["Resolution", `${ow}×${oh} · Lanczos upscale`],
             ["Sharpen", "unsharp 5:5:0.8:3:3:0.4"],
-            ["Video", `H.264 High ${quality === "4k" ? "5.1" : "4.2"} · yuv420p`],
+            ["Video", `H.264 High ${PRESETS[quality].level} · yuv420p`],
             ["Quality", "CRF 28 · preset slow"],
-            ["Bitrate", quality === "4k" ? "8000k · max 10000k · buf 20000k" : "2500k · max 3000k · buf 6000k"],
+            ["Bitrate", `${PRESETS[quality].b} · max ${PRESETS[quality].max} · buf ${PRESETS[quality].buf}`],
             ["Audio / FPS", "AAC 96k · 30fps CFR · faststart"],
           ].map(([k, v]) => (
             <div key={k} className="rounded-xl border border-border bg-card/60 p-3">
@@ -338,10 +350,11 @@ function Index() {
           <h2 className="font-display text-2xl font-bold">Why Pinterest videos stay sharp and game clips blur</h2>
           <ul className="mt-4 space-y-3 text-sm text-muted-foreground">
             <li>• WhatsApp re-compresses any Status that's too big, too long, or has an odd format — 60fps game clips get crushed hard.</li>
-            <li>• Pinterest-style videos are already 1080×1920, 30fps, H.264 with a modest bitrate — WhatsApp sees nothing to fix and leaves them alone.</li>
+            <li>• Pinterest-style videos are already 1080×1920, 30fps, H.264 with a modest bitrate — WhatsApp has very little to fix, so it barely touches them.</li>
             <li>• Lanczos upscaling + light sharpening keeps edges crisp so the "fake 4K" look survives on phone screens.</li>
-            <li>• Parts of up to 1:30 fit WhatsApp's Status limit, so nothing gets trimmed or re-encoded.</li>
+            <li>• Parts of up to 1:30 fit WhatsApp's Status limit, so nothing gets trimmed.</li>
             <li>• Canvas mode keeps your whole clip visible on a 9:16 frame with a blurred background instead of cropping the sides.</li>
+            <li>• Tip: in WhatsApp Settings → Storage and data → Media upload quality, choose <b>HD quality</b>. Without this, WhatsApp shrinks every video no matter how it was made.</li>
           </ul>
           <p className="mt-4 flex items-center gap-2 text-sm"><ShieldCheck className="h-4 w-4 text-primary" /> 100% private — your video never leaves your device.</p>
         </section>
